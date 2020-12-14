@@ -30,9 +30,10 @@ use sp_runtime::{
 use frame_support::{
 	assert_ok, assert_err_ignore_postinfo, impl_outer_dispatch, impl_outer_event,
 	impl_outer_origin, parameter_types, StorageMap,
-	traits::{Currency, ReservableCurrency},
+	traits::{Currency, ReservableCurrency, OnInitialize},
 	weights::{Weight, PostDispatchInfo},
 	dispatch::DispatchErrorWithPostInfo,
+	storage::child,
 };
 use frame_system::{self as system, EventRecord, Phase};
 
@@ -1914,5 +1915,54 @@ fn instantiate_return_code() {
 		).exec_result.unwrap();
 		assert_return_code!(result, RuntimeReturnCode::CalleeTrapped);
 
+	});
+}
+
+#[test]
+fn lazy_removal_works() {
+	let (code, hash) = compile_module::<Test>("self_destruct").unwrap();
+	ExtBuilder::default().existential_deposit(50).build().execute_with(|| {
+		let subsistence = ConfigCache::<Test>::subsistence_threshold_uncached();
+		let _ = Balances::deposit_creating(&ALICE, 10 * subsistence);
+		assert_ok!(Contracts::put_code(Origin::signed(ALICE), code));
+
+		assert_ok!(
+			Contracts::instantiate(
+				Origin::signed(ALICE),
+				subsistence,
+				GAS_LIMIT,
+				hash.into(),
+				vec![],
+				vec![],
+			),
+		);
+
+		let addr = Contracts::contract_address(&ALICE, &hash, &[]);
+		let info = <ContractInfoOf::<Test>>::get(&addr).unwrap().get_alive().unwrap();
+		let trie = &info.child_trie_info();
+
+		// Put value into the contracts child trie
+		child::put(trie, &[99], &42);
+
+		// Terminate the contracz
+		assert_ok!(Contracts::call(
+			Origin::signed(ALICE),
+			addr.clone(),
+			0,
+			GAS_LIMIT,
+			vec![],
+		));
+
+		// Contract info should be gone
+		assert!(!<ContractInfoOf::<Test>>::contains_key(&addr));
+
+		// But value should be still there as the lazy removal did not run, yet.
+		assert_matches!(child::get(trie, &[99]), Some(42));
+
+		// Run the lazy removal
+		Contracts::on_initialize(0);
+
+		// Value should be gone now
+		assert_matches!(child::get::<i32>(trie, &[99]), None);
 	});
 }
